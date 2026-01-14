@@ -25,9 +25,9 @@ the following functionality:
 1. New Card Checkout
 2. Saved Card Checkout
 
-To use Coinflow's PCI-compliant card input elements follow this recipe: https://docs.coinflow.cash/recipes/pci-compliant-credit-card-tokenization
-To call Coinflow's checkout endpoints view the API docs here: https://docs.coinflow.cash/reference/gettotals
-To view test cards and test various scenarios view here: https://docs.coinflow.cash/docs/testing-credit-card-purchases#3ds-enabled-card-purchases
+To use Coinflow's PCI-compliant card input elements follow this recipe: https://docs.coinflow.cash/recipes/recipes/pci-compliant-card-tokenization
+To call Coinflow's checkout endpoints view the API docs here: https://docs.coinflow.cash/api-reference/api-reference/checkout/get-totals
+To view test cards and test various scenarios view here: https://docs.coinflow.cash/guides/checkout/testing/testing-credit-cards
 
 Note: the merchantId you will be using is `swe-challenge`
 
