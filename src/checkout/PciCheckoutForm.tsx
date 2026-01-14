@@ -2,14 +2,17 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { HTMLInputTypeAttribute } from "react";
 import {
   CardType,
+  CoinflowCardNumberInput,
+  CoinflowCvvInput,
   CoinflowCvvOnlyInput,
 } from "@coinflowlabs/react";
 import { usePrivy } from "@privy-io/react-auth";
 import { useWallet } from "../wallet/Wallet";
 
-const MERCHANT_ID = "swe-challenge";
+// Getting unauthorized on Checkout API, so using my own sandbox merchant ID for now
+// const MERCHANT_ID = "swe-challenge";
+const MERCHANT_ID = "sandbox-merchant-id-peter-ryszkiewicz";
 const SANDBOX_API_KEY = import.meta.env.VITE_SANDBOX_API_KEY as string | undefined;
-const TOKENEX_ORIGIN = "http://localhost:5173";
 
 type CardTokenResponse = {
   token: string;
@@ -30,10 +33,35 @@ type CurrencyCents = {
   cents: number;
 };
 
-type TokenExConfig = {
-  tokenExId: string;
-  authenticationKey: string;
-  timestamp: string;
+const parseString = (value: unknown): string | null => {
+  if (typeof value === "string" && value.trim().length > 0) {
+    return value;
+  }
+  if (typeof value === "number" && Number.isFinite(value)) {
+    return String(value);
+  }
+  return null;
+};
+
+const extractSavedCardEntries = (
+  record: Record<string, unknown>
+): unknown[] | null => {
+  const candidates = [
+    record.cards,
+    record.cardTokens,
+    record.paymentMethods,
+    record.payment_methods,
+    record.savedCards,
+    record.saved_cards,
+  ];
+
+  for (const candidate of candidates) {
+    if (Array.isArray(candidate)) {
+      return candidate;
+    }
+  }
+
+  return null;
 };
 
 const parseCurrencyCents = (value: unknown): CurrencyCents | null => {
@@ -42,29 +70,6 @@ const parseCurrencyCents = (value: unknown): CurrencyCents | null => {
   if (typeof record.cents !== "number") return null;
   if (typeof record.currency !== "string") return null;
   return { cents: record.cents, currency: record.currency };
-};
-
-const buildTokenExUrl = (
-  timestamp: string,
-  authenticationKey: string,
-  tokenExId: string
-) => {
-  const params = new URLSearchParams({
-    AuthenticationKey: authenticationKey,
-    Origin: TOKENEX_ORIGIN,
-    TokenExID: tokenExId,
-    Timestamp: timestamp,
-    Container: "tokenExCardNumber",
-    Mode: "Data",
-    PCI: "true",
-    EnforceLuhnCompliance: "true",
-    CvvContainer: "tokenExCardCvv",
-    CVV: "true",
-    TokenScheme: "sixANTOKENfour",
-    ExpiresInSeconds: "1200",
-  });
-
-  return `https://test-htp.tokenex.com/iframe/v3?${params.toString()}`;
 };
 
 const parseTotalsResponse = (
@@ -84,6 +89,9 @@ const parseTotalsResponse = (
 export function PciCheckoutForm({ onSuccess }: { onSuccess: () => void }) {
   const { user } = usePrivy();
   const { wallet, ready } = useWallet();
+  const cardInputRef = useRef<{ getToken: () => Promise<CardTokenResponse> }>(
+    null
+  );
   const savedCardInputRef = useRef<{ getToken: () => Promise<CardTokenResponse> }>(
     null
   );
@@ -101,9 +109,7 @@ export function PciCheckoutForm({ onSuccess }: { onSuccess: () => void }) {
   const [sessionKey, setSessionKey] = useState<string | null>(null);
   const [sessionKeyError, setSessionKeyError] = useState<string | null>(null);
   const [isSessionKeyLoading, setIsSessionKeyLoading] = useState(false);
-  const [cardNumber, setCardNumber] = useState("4111111111111111");
-  const [cardCvv, setCardCvv] = useState("111");
-
+  const [isSavedCardLoading, setIsSavedCardLoading] = useState(false);
   const [formState, setFormState] = useState({
     expMonth: "05",
     expYear: "27",
@@ -128,11 +134,13 @@ export function PciCheckoutForm({ onSuccess }: { onSuccess: () => void }) {
     () => total ?? resolvedSubtotal,
     [resolvedSubtotal, total]
   );
-  const isCheckoutReady = Boolean(sessionKey) && !isSessionKeyLoading;
   const coinflowEnv = "sandbox";
-  const merchantId = "swe-challenge";
+  const merchantId = MERCHANT_ID;
   const apiBaseUrl = "https://api-sandbox.coinflow.cash";
   const apiKey = SANDBOX_API_KEY;
+  const checkoutAuthKey = sessionKey ?? apiKey ?? null;
+  const isCheckoutReady = Boolean(checkoutAuthKey) && !isSessionKeyLoading;
+  const savedCheckoutTimeoutMs = 8000;
   const buildHeaders = useCallback(
     (extra?: Record<string, string>) => {
       const headers: Record<string, string> = {
@@ -141,13 +149,13 @@ export function PciCheckoutForm({ onSuccess }: { onSuccess: () => void }) {
         ...extra,
       };
 
-      if (sessionKey) {
-        headers["x-coinflow-auth-session-key"] = sessionKey;
+      if (checkoutAuthKey) {
+        headers["x-coinflow-auth-session-key"] = checkoutAuthKey;
       }
 
       return headers;
     },
-    [sessionKey]
+    [checkoutAuthKey]
   );
 
   const logError = useCallback((context: string, error: unknown) => {
@@ -221,160 +229,76 @@ export function PciCheckoutForm({ onSuccess }: { onSuccess: () => void }) {
     return null;
   }, []);
 
+  const parseSavedCardEntry = useCallback(
+    (value: unknown): SavedCard | null => {
+      if (!value || typeof value !== "object") return null;
+      const record = value as Record<string, unknown>;
+      const token = parseString(
+        record.token ?? record.cardToken ?? record.card_token
+      );
+      if (!token) return null;
+
+      const cardTypeValue = parseString(
+        record.cardType ?? record.type ?? record.brand ?? record.network
+      );
+      const cardType = normalizeCardType(cardTypeValue);
+      if (!cardType) return null;
+
+      const firstSix = parseString(
+        record.firstSix ??
+          record.first_six ??
+          record.first6 ??
+          record.bin ??
+          record.binNumber
+      );
+      const lastFour = parseString(
+        record.lastFour ??
+          record.last_four ??
+          record.last4 ??
+          record.lastDigits ??
+          record.last_digits
+      );
+      return {
+        token,
+        cardType,
+        firstSix: firstSix ?? undefined,
+        lastFour: lastFour ?? undefined,
+      };
+    },
+    [normalizeCardType]
+  );
+
+  const parseSavedCardResponse = useCallback(
+    (value: unknown): SavedCard | null => {
+      if (!value || typeof value !== "object") return null;
+      const record = value as Record<string, unknown>;
+      const customerRecord =
+        record.customer && typeof record.customer === "object"
+          ? (record.customer as Record<string, unknown>)
+          : record;
+      const entries = extractSavedCardEntries(customerRecord);
+      if (entries) {
+        for (const entry of entries) {
+          const parsed = parseSavedCardEntry(entry);
+          if (parsed) return parsed;
+        }
+      }
+
+      return parseSavedCardEntry(
+        customerRecord.card ??
+          customerRecord.paymentMethod ??
+          customerRecord.savedCard
+      );
+    },
+    [parseSavedCardEntry]
+  );
+
   const parseError = useCallback(async (response: Response) => {
     const maybeJson = await response.json().catch(() => null);
     if (maybeJson?.message) return maybeJson.message as string;
     if (maybeJson?.error) return maybeJson.error as string;
     return `Request failed with status ${response.status}`;
   }, []);
-
-  const parseTokenExToken = useCallback((value: unknown): CardTokenResponse => {
-    if (!value || typeof value !== "object") {
-      throw new Error("TokenEx response is missing token data.");
-    }
-
-    const record = value as Record<string, unknown>;
-    const token =
-      (typeof record.Token === "string" && record.Token) ||
-      (typeof record.token === "string" && record.token);
-
-    if (!token) {
-      throw new Error("TokenEx token missing from response.");
-    }
-
-    const cardType =
-      (typeof record.CardType === "string" && record.CardType) ||
-      (typeof record.cardType === "string" && record.cardType);
-    const firstSix =
-      (typeof record.FirstSix === "string" && record.FirstSix) ||
-      (typeof record.firstSix === "string" && record.firstSix);
-    const lastFour =
-      (typeof record.LastFour === "string" && record.LastFour) ||
-      (typeof record.lastFour === "string" && record.lastFour);
-
-    return {
-      token,
-      cardType: cardType || undefined,
-      firstSix: firstSix || undefined,
-      lastFour: lastFour || undefined,
-    };
-  }, []);
-
-  const parseTokenExConfig = useCallback((value: unknown): TokenExConfig => {
-    if (!value || typeof value !== "object") {
-      throw new Error("TokenEx config response is missing data.");
-    }
-
-    const record = value as Record<string, unknown>;
-    const tokenExId =
-      (typeof record.TokenExID === "string" && record.TokenExID) ||
-      (typeof record.tokenExId === "string" && record.tokenExId) ||
-      null;
-    const authenticationKey =
-      (typeof record.AuthenticationKey === "string" && record.AuthenticationKey) ||
-      (typeof record.authenticationKey === "string" && record.authenticationKey) ||
-      null;
-    const timestamp =
-      (typeof record.Timestamp === "string" && record.Timestamp) ||
-      (typeof record.timestamp === "string" && record.timestamp) ||
-      null;
-
-    if (!authenticationKey) {
-      throw new Error("TokenEx AuthenticationKey missing from config response.");
-    }
-
-    if (!tokenExId) {
-      throw new Error("TokenExID missing from config response.");
-    }
-
-    if (!timestamp) {
-      throw new Error("TokenEx Timestamp missing from config response.");
-    }
-
-    return {
-      tokenExId,
-      authenticationKey,
-      timestamp,
-    };
-  }, []);
-
-  // FIXME: returns 404; we need this to obtain the tokenExID, timestamp, and authenticationKey in order to tokenize the card
-  const fetchTokenExConfig = useCallback(async () => {
-    const response = await fetch(`${apiBaseUrl}/api/tokenization/mobile/config`, {
-      method: "GET",
-      headers: buildHeaders({ accept: "application/json" }),
-    });
-
-    if (!response.ok) {
-      throw new Error(await parseError(response));
-    }
-
-    const responseJson = await response.json().catch(() => null);
-    return parseTokenExConfig(responseJson);
-  }, [apiBaseUrl, buildHeaders, parseError, parseTokenExConfig]);
-
-  const tokenizeCardWithTokenEx = useCallback(
-    async (cardNumberValue: string, cardCvvValue: string) => {
-      const trimmedCardNumber = cardNumberValue.trim();
-      const trimmedCvv = cardCvvValue.trim();
-      if (!trimmedCardNumber) {
-        throw new Error("Card number is required.");
-      }
-      if (!trimmedCvv) {
-        throw new Error("CVV is required.");
-      }
-
-      const { authenticationKey, timestamp, tokenExId } =
-        await fetchTokenExConfig();
-      const tokenExUrl = buildTokenExUrl(
-        timestamp,
-        authenticationKey,
-        tokenExId
-      );
-
-      const payload = {
-        TokenExID: tokenExId,
-        Origin: TOKENEX_ORIGIN,
-        AuthenticationKey: authenticationKey,
-        Timestamp: timestamp,
-        Data: trimmedCardNumber,
-        CvvValue: trimmedCvv,
-        TokenScheme: "sixANTOKENfour",
-        CvvOnly: "False",
-        PCI: "True",
-        ReturnHash: null,
-        use3DS: "False",
-        ThreeDSMethodNotificationUrl: "",
-        kountSessionId: "",
-        fraudMerchantId: "",
-        UseKount: "False",
-        kountMode: "",
-        kountAnId: "",
-        FraudServicesRiskRequestModel: "",
-        EnforceLuhnCompliance: "true",
-        CustomDataLuhnCheck: true,
-      };
-
-      const response = await fetch(tokenExUrl, {
-        method: "POST",
-        headers: {
-          accept: "*/*",
-          "content-type": "application/json",
-        },
-        body: JSON.stringify(payload),
-        mode: "cors",
-        credentials: "omit",
-      });
-
-      if (!response.ok) {
-        throw new Error(`TokenEx request failed with status ${response.status}`);
-      }
-
-      const responseJson = await response.json().catch(() => null);
-      return parseTokenExToken(responseJson);
-    },
-    [fetchTokenExConfig, parseTokenExToken]
-  );
 
   const postJson = useCallback(
     async (path: string, payload: object) => {
@@ -394,12 +318,8 @@ export function PciCheckoutForm({ onSuccess }: { onSuccess: () => void }) {
   );
 
   const fetchSessionKey = useCallback(async () => {
-    // if (!apiKey) {
-    //   setSessionKeyError("Missing Coinflow API key. Set VITE_SANDBOX_API_KEY.");
-    //   return;
-    // }
-
     if (!ready) return;
+    if (sessionKey || isSessionKeyLoading) return;
 
     setSessionKeyError(null);
     setIsSessionKeyLoading(true);
@@ -408,6 +328,7 @@ export function PciCheckoutForm({ onSuccess }: { onSuccess: () => void }) {
     const userId = getUserIdentifier();
     if (!walletAddress && !userId) {
       setSessionKeyError("Missing user identity for Coinflow session key.");
+      setIsSessionKeyLoading(false);
       return;
     }
 
@@ -462,9 +383,9 @@ export function PciCheckoutForm({ onSuccess }: { onSuccess: () => void }) {
   ]);
 
   const fetchTotals = useCallback(async () => {
-    if (!sessionKey) {
+    if (!checkoutAuthKey) {
       setTotalsError(
-        "Waiting for Coinflow session key before loading totals."
+        "Waiting for Coinflow auth key before loading totals."
       );
       return;
     }
@@ -502,7 +423,61 @@ export function PciCheckoutForm({ onSuccess }: { onSuccess: () => void }) {
     } finally {
       setIsTotalsLoading(false);
     }
-  }, [apiBaseUrl, baseSubtotal, buildHeaders, merchantId, parseError, sessionKey]);
+  }, [
+    apiBaseUrl,
+    baseSubtotal,
+    buildHeaders,
+    checkoutAuthKey,
+    merchantId,
+    parseError,
+  ]);
+
+  const fetchSavedCard = useCallback(async () => {
+    if (!checkoutAuthKey) {
+      setSavedError("Waiting for Coinflow auth key before loading saved card.");
+      return;
+    }
+
+    setIsSavedCardLoading(true);
+    setSavedError(null);
+    try {
+      const response = await fetch(`${apiBaseUrl}/api/customer/v2`, {
+        method: "GET",
+        headers: buildHeaders(),
+      });
+
+      if (!response.ok) {
+        throw new Error(await parseError(response));
+      }
+
+      const data = await response.json().catch(() => ({}));
+      const parsedCard = parseSavedCardResponse(data);
+      if (parsedCard) {
+        setSavedCard(parsedCard);
+        logSuccess("Saved card fetched.", {
+          token: parsedCard.token,
+          cardType: parsedCard.cardType,
+        });
+      } else {
+        setSavedError("No saved card available for this customer.");
+      }
+    } catch (error) {
+      logError("Failed to fetch saved card.", error);
+      const message =
+        error instanceof Error ? error.message : "Failed to fetch saved card.";
+      setSavedError(message);
+    } finally {
+      setIsSavedCardLoading(false);
+    }
+  }, [
+    apiBaseUrl,
+    buildHeaders,
+    checkoutAuthKey,
+    logError,
+    logSuccess,
+    parseError,
+    parseSavedCardResponse,
+  ]);
 
   useEffect(() => {
     fetchSessionKey().catch((error) => {
@@ -511,11 +486,19 @@ export function PciCheckoutForm({ onSuccess }: { onSuccess: () => void }) {
   }, [fetchSessionKey, logError]);
 
   useEffect(() => {
-    if (!sessionKey) return;
+    if (!checkoutAuthKey) return;
     fetchTotals().catch((error) => {
       logError("Unhandled totals rejection.", error);
     });
-  }, [fetchTotals, logError, sessionKey]);
+  }, [checkoutAuthKey, fetchTotals, logError]);
+
+  useEffect(() => {
+    if (checkoutMode !== "saved") return;
+    if (savedCard || isSavedCardLoading) return;
+    fetchSavedCard().catch((error) => {
+      logError("Unhandled saved card rejection.", error);
+    });
+  }, [checkoutMode, fetchSavedCard, isSavedCardLoading, logError, savedCard]);
 
   const handleCardCheckout = useCallback(async () => {
     setCardError(null);
@@ -527,9 +510,14 @@ export function PciCheckoutForm({ onSuccess }: { onSuccess: () => void }) {
       return;
     }
 
+    if (!cardInputRef.current) {
+      setCardError("Card inputs are not ready yet.");
+      return;
+    }
+
     setIsCardSubmitting(true);
     try {
-      const tokenResponse = await tokenizeCardWithTokenEx(cardNumber, cardCvv);
+      const tokenResponse = await cardInputRef.current.getToken();
       const cardType = normalizeCardType(tokenResponse.cardType);
       const payload = {
         subtotal: resolvedSubtotal,
@@ -570,15 +558,12 @@ export function PciCheckoutForm({ onSuccess }: { onSuccess: () => void }) {
       setIsCardSubmitting(false);
     }
   }, [
-    cardCvv,
-    cardNumber,
     formState,
     merchantId,
     normalizeCardType,
     onSuccess,
     postJson,
     resolvedSubtotal,
-    tokenizeCardWithTokenEx,
     validateCardForm,
   ]);
 
@@ -597,23 +582,66 @@ export function PciCheckoutForm({ onSuccess }: { onSuccess: () => void }) {
 
     setIsSavedSubmitting(true);
     try {
+      console.log("getting token...");
+      // Hangs here
       const tokenResponse = await savedCardInputRef.current.getToken();
+      console.log("tokenResponse: ", tokenResponse);
+      if (!tokenResponse?.token) {
+        setSavedError("TokenEx did not return a card token. Please retry.");
+        return;
+      }
       const payload = {
         subtotal: resolvedSubtotal,
         token: tokenResponse.token,
       };
 
-      await postJson(`/api/checkout/token/${merchantId}`, payload);
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => {
+        controller.abort();
+      }, savedCheckoutTimeoutMs);
+      const response = await fetch(`${apiBaseUrl}/api/checkout/token/${merchantId}`, {
+        method: "POST",
+        headers: buildHeaders(),
+        body: JSON.stringify(payload),
+        signal: controller.signal,
+      }).finally(() => {
+        clearTimeout(timeoutId);
+      });
+
+      if (!response.ok) {
+        throw new Error(await parseError(response));
+      }
+
+      const responseData = await response.json().catch(() => ({}));
+      console.log("checkout token response: ", response);
+      const updatedSavedCard = parseSavedCardResponse(responseData);
+      if (updatedSavedCard) {
+        setSavedCard(updatedSavedCard);
+      }
       onSuccess();
     } catch (error) {
       logError("Saved card checkout failed.", error);
       const message =
-        error instanceof Error ? error.message : "Saved card checkout failed.";
+        error instanceof DOMException && error.name === "AbortError"
+          ? "Saved card checkout timed out. Please try again."
+          : error instanceof Error
+            ? error.message
+            : "Saved card checkout failed.";
       setSavedError(message);
     } finally {
       setIsSavedSubmitting(false);
     }
-  }, [merchantId, onSuccess, postJson, savedCard, resolvedSubtotal]);
+  }, [
+    apiBaseUrl,
+    buildHeaders,
+    merchantId,
+    onSuccess,
+    parseSavedCardResponse,
+    parseError,
+    savedCard,
+    savedCheckoutTimeoutMs,
+    resolvedSubtotal,
+  ]);
 
   return (
     <div className="h-full flex-1 w-full pb-20">
@@ -681,25 +709,22 @@ export function PciCheckoutForm({ onSuccess }: { onSuccess: () => void }) {
                 ) : null}
               </div>
 
-              <div className="rounded-xl border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-900">
-                Prefilled with dummy card data (4111111111111111, 111, 05/27)
-                to speed up testing.
-              </div>
-
               <div className="grid gap-3">
-                <InputField
-                  label="Card Number"
-                  value={cardNumber}
-                  onChange={setCardNumber}
-                  placeholder="4111 1111 1111 1111"
+                <label className="text-xs font-semibold text-slate-600">
+                  Card Number
+                </label>
+                <CoinflowCardNumberInput
+                  ref={cardInputRef}
+                  env={coinflowEnv}
+                  merchantId={MERCHANT_ID}
+                  debug={true}
+                  css={inputStyles}
+                  origins={origins}
                 />
-                <InputField
-                  label="CVV"
-                  value={cardCvv}
-                  onChange={setCardCvv}
-                  placeholder="123"
-                  maybeInputType="password"
-                />
+                <label className="text-xs font-semibold text-slate-600">
+                  CVV
+                </label>
+                <CoinflowCvvInput />
               </div>
 
               <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
@@ -799,10 +824,12 @@ export function PciCheckoutForm({ onSuccess }: { onSuccess: () => void }) {
                 </p>
               </div>
 
-              {savedCard ? (
+              {isSavedCardLoading ? (
+                <p className="text-xs text-slate-500">Loading saved card...</p>
+              ) : savedCard ? (
                 <>
                   <div className="rounded-xl bg-slate-50 p-3 text-xs text-slate-600">
-                    Saved Token: {savedCard.firstSix ?? "••••••"}
+                    Saved Card: {savedCard.firstSix ?? "••••••"}
                     {savedCard.lastFour ?? "••••"} ({savedCard.cardType})
                   </div>
                   <label className="text-xs font-semibold text-slate-600">
