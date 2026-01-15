@@ -445,12 +445,10 @@ export function PciCheckoutForm({ onSuccess }: { onSuccess: () => void }) {
       setIsTotalsLoading(false);
     }
   }, [
-    API_BASE_URL,
     defaultSubtotal,
     logError,
     logSuccess,
     maybeWalletPublicKey,
-    MERCHANT_ID,
   ]);
 
   const fetchSavedCard = useCallback(async () => {
@@ -491,7 +489,6 @@ export function PciCheckoutForm({ onSuccess }: { onSuccess: () => void }) {
       dispatchSavedCardLookupSubmission({ type: "error", message });
     }
   }, [
-    API_BASE_URL,
     logError,
     logSuccess,
     maybeWalletPublicKey,
@@ -586,14 +583,12 @@ export function PciCheckoutForm({ onSuccess }: { onSuccess: () => void }) {
     }
   }, [
     formState,
-    API_BASE_URL,
-    MERCHANT_ID,
     onSuccess,
     checkoutSubtotal,
     validateCardForm,
     maybeWalletPublicKey,
-    AUTH_BLOCKCHAIN,
     buildSavedCardFromTokenPayload,
+    logError,
   ]);
 
   const handleSavedCardCheckout = useCallback(async () => {
@@ -673,8 +668,7 @@ export function PciCheckoutForm({ onSuccess }: { onSuccess: () => void }) {
       dispatchSavedCardCheckoutSubmission({ type: "error", message });
     }
   }, [
-    API_BASE_URL,
-    MERCHANT_ID,
+    logError,
     maybeWalletPublicKey,
     onSuccess,
     extractFirstSavedCardFromCustomer,

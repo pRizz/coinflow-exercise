@@ -6,7 +6,6 @@ import { CoinflowForm } from "./CoinflowForm";
 import { Header } from "./Header";
 import { LoginModal } from "./modals/LoginModal.tsx";
 import { useSolanaWallets, usePrivy } from "@privy-io/react-auth";
-import console from "console";
 import {DirectPurchaseForm} from "./DirectPurchaseForm.tsx";
 
 export const focusedNft = {
@@ -76,7 +75,6 @@ function AppContent() {
 }
 
 function CoinflowContent() {
-  const { user } = usePrivy();
   const { wallet } = useWallet();
 
   if (!wallet.publicKey) return null;
