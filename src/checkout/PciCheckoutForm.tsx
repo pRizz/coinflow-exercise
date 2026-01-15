@@ -289,6 +289,7 @@ export function PciCheckoutForm({ onSuccess }: { onSuccess: () => void }) {
   const isSavedCardBusy = isSavedCardLoading || isSavedCardCheckoutSubmitting;
   const maybeCardDisabledReason = isCardSubmitting ? "Card payment is processing." : null;
   const isCardDisabled = maybeCardDisabledReason !== null;
+  const savedCardTokenTimeoutMs = 6000;
   const savedCardCheckoutTimeoutMs = 8000;
 
   const logError = useCallback((context: string, error: unknown) => {
@@ -612,10 +613,28 @@ export function PciCheckoutForm({ onSuccess }: { onSuccess: () => void }) {
 
     dispatchSavedCardCheckoutSubmission({ type: "submit" });
     try {
-      console.log("getting token...");
-      // FIXME: Hangs here for some reason
-      const tokenResponse = await savedCardInputRef.current.getToken();
-      console.log("tokenResponse: ", tokenResponse);
+      logSuccess("Requesting saved card token.", {
+        cardType: savedCard.cardType ?? null,
+        lastFour: savedCard.lastFour ?? null,
+      });
+      let timeoutId: ReturnType<typeof setTimeout> | undefined;
+      const tokenResponse = await Promise.race([
+        savedCardInputRef.current.getToken(),
+        new Promise<never>((_, reject) => {
+          timeoutId = setTimeout(() => {
+            reject(
+              new Error(
+                "Saved card tokenization timed out. Make sure the CVV input is loaded and a CVV is entered."
+              )
+            );
+          }, savedCardTokenTimeoutMs);
+        }),
+      ]).finally(() => {
+        if (timeoutId) {
+          clearTimeout(timeoutId);
+        }
+      });
+      logSuccess("Saved card token response received.");
       if (!tokenResponse?.token) {
         dispatchSavedCardCheckoutSubmission({
           type: "error",
@@ -637,7 +656,7 @@ export function PciCheckoutForm({ onSuccess }: { onSuccess: () => void }) {
 
       // For handling timeouts
       const abortController = new AbortController();
-      const timeoutId = setTimeout(() => {
+      const checkoutTimeoutId = setTimeout(() => {
         abortController.abort();
       }, savedCardCheckoutTimeoutMs);
       const tokenCheckoutResponse = await createCoinflowTokenCheckout({
@@ -648,7 +667,7 @@ export function PciCheckoutForm({ onSuccess }: { onSuccess: () => void }) {
         payload,
         signal: abortController.signal,
       }).finally(() => {
-        clearTimeout(timeoutId);
+        clearTimeout(checkoutTimeoutId);
       });
       console.log("checkout token response: ", tokenCheckoutResponse);
       const updatedSavedCard = extractFirstSavedCardFromCustomer(tokenCheckoutResponse);
@@ -669,11 +688,13 @@ export function PciCheckoutForm({ onSuccess }: { onSuccess: () => void }) {
     }
   }, [
     logError,
+    logSuccess,
     maybeWalletPublicKey,
     onSuccess,
     extractFirstSavedCardFromCustomer,
     savedCard,
     savedCardCheckoutTimeoutMs,
+    savedCardTokenTimeoutMs,
     checkoutSubtotal,
   ]);
 
@@ -881,6 +902,7 @@ export function PciCheckoutForm({ onSuccess }: { onSuccess: () => void }) {
                         ref={savedCardInputRef}
                         env={COINFLOW_ENV}
                         merchantId={MERCHANT_ID}
+                        debug={true}
                         css={inputStyles}
                         origins={origins}
                         token={savedCard.token}
