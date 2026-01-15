@@ -45,12 +45,18 @@ export function WalletContextProvider({ children }: { children: ReactNode }) {
     return wallets[0];
   }, [user, wallets]);
 
+  const maybePublicKey = useMemo(() => {
+    if (!user || !solanaWallet) return null;
+
+    return new PublicKey(solanaWallet.address);
+  }, [user, solanaWallet]);
+
   const signTransaction = useCallback(
     async <T extends Transaction | VersionedTransaction>(
       transaction: T
     ): Promise<T> => {
       const tx = transaction as VersionedTransaction;
-      const serializedMessage = Buffer.from(tx.message.serialize());
+      const serializedMessage = tx.message.serialize();
       const provider = await solanaWallet!.getProvider();
 
       const { signature } = await provider.request({
@@ -83,19 +89,20 @@ export function WalletContextProvider({ children }: { children: ReactNode }) {
     [connection, signTransaction]
   );
 
+  const walletContextValue = useMemo(() => {
+    return {
+      wallet: {
+        publicKey: maybePublicKey,
+        signTransaction,
+        sendTransaction,
+      },
+      connection,
+      ready,
+    };
+  }, [maybePublicKey, signTransaction, sendTransaction, connection, ready]);
+
   return (
-    <WalletContext.Provider
-      value={{
-        wallet: {
-          publicKey:
-            user && solanaWallet ? new PublicKey(solanaWallet.address) : null,
-          signTransaction,
-          sendTransaction,
-        },
-        connection,
-        ready,
-      }}
-    >
+    <WalletContext.Provider value={walletContextValue}>
       {children}
     </WalletContext.Provider>
   );

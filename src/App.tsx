@@ -79,9 +79,6 @@ function CoinflowContent() {
   const { user } = usePrivy();
   const { wallet } = useWallet();
 
-  console.log({ wallet });
-  console.log({ user });
-
   if (!wallet.publicKey) return null;
 
   return <CoinflowForm />;

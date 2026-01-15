@@ -1,38 +1,92 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useReducer, useRef, useState } from "react";
 import type { HTMLInputTypeAttribute } from "react";
 import {
   CardType,
   CoinflowCardNumberInput,
+  CoinflowCardTokenResponse,
   CoinflowCvvInput,
   CoinflowCvvOnlyInput,
 } from "@coinflowlabs/react";
-import { usePrivy } from "@privy-io/react-auth";
+import {
+  createCoinflowCardCheckout,
+  createCoinflowTokenCheckout,
+  fetchCoinflowCustomer,
+  fetchCoinflowTotals,
+} from "../coinflowAPI/coinflowAPI";
 import { useWallet } from "../wallet/Wallet";
 
-// Getting unauthorized on Checkout API, so using my own sandbox merchant ID for now
-// const MERCHANT_ID = "swe-challenge";
-const MERCHANT_ID = "sandbox-merchant-id-peter-ryszkiewicz";
-const SANDBOX_API_KEY = import.meta.env.VITE_SANDBOX_API_KEY as string | undefined;
+const MERCHANT_ID = "swe-challenge";
+const AUTH_BLOCKCHAIN = "solana";
+const COINFLOW_ENV = "sandbox";
+const API_BASE_URL = "https://api-sandbox.coinflow.cash";
 
-type CardTokenResponse = {
+type CardToken = {
   token: string;
-  cardType?: string;
   firstSix?: string;
   lastFour?: string;
+  cardType?: CardType;
 };
 
-type SavedCard = {
-  token: string;
-  cardType: CardType;
-  firstSix?: string;
-  lastFour?: string;
-};
+type CardTokenResponse = CardToken;
+
+type SavedCard = CardToken;
 
 type CurrencyCents = {
   currency: string;
   cents: number;
 };
 
+type CardTokenPayload = {
+  firstSix: string;
+  lastFour: string;
+  token: string;
+  referenceNumber: string;
+  tokenHMAC: string;
+  maybeCardType?: CardType;
+};
+
+/**
+ * Submission states used for both new and saved card flows.
+ */
+type SubmissionStatus = "idle" | "submitting" | "success" | "error";
+
+type SubmissionState = {
+  status: SubmissionStatus;
+  message: string | null;
+};
+
+type SubmissionAction =
+  | { type: "reset" }
+  | { type: "submit" }
+  | { type: "success"; message?: string }
+  | { type: "error"; message: string };
+
+const initialSubmissionState: SubmissionState = {
+  status: "idle",
+  message: null,
+};
+
+const submissionReducer = (
+  _state: SubmissionState,
+  action: SubmissionAction
+): SubmissionState => {
+  switch (action.type) {
+    case "reset":
+      return initialSubmissionState;
+    case "submit":
+      return { status: "submitting", message: null };
+    case "success":
+      return { status: "success", message: action.message ?? null };
+    case "error":
+      return { status: "error", message: action.message };
+    default:
+      return _state;
+  }
+};
+
+/**
+ * Coerces unknown values into a non-empty string when possible.
+ */
 const parseString = (value: unknown): string | null => {
   if (typeof value === "string" && value.trim().length > 0) {
     return value;
@@ -43,6 +97,21 @@ const parseString = (value: unknown): string | null => {
   return null;
 };
 
+const normalizeCardTypeValue = (
+  value?: CardType | string | null
+): CardType | null => {
+  if (!value) return null;
+  const upper = value.toUpperCase();
+  const maybeCardType = Object.values(CardType).find(
+    (cardType) => cardType === upper
+  );
+  return maybeCardType ?? null;
+};
+
+/**
+ * Extracts the saved card list from a backend payload by checking
+ * multiple possible keys, returning the first array candidate.
+ */
 const extractSavedCardEntries = (
   record: Record<string, unknown>
 ): unknown[] | null => {
@@ -72,6 +141,66 @@ const parseCurrencyCents = (value: unknown): CurrencyCents | null => {
   return { cents: record.cents, currency: record.currency };
 };
 
+const parseCardTokenResponse = (value: unknown): CardTokenPayload | null => {
+  if (!value || typeof value !== "object") return null;
+  const record = value as {
+    firstSix?: unknown;
+    lastFour?: unknown;
+    token?: unknown;
+    referenceNumber?: unknown;
+    tokenHMAC?: unknown;
+    cardType?: unknown;
+  };
+  const firstSix = parseString(record.firstSix);
+  const lastFour = parseString(record.lastFour);
+  const token = parseString(record.token);
+  const referenceNumber = parseString(record.referenceNumber);
+  const tokenHMAC = parseString(record.tokenHMAC);
+  const rawCardType = parseString(record.cardType);
+  const maybeCardType = normalizeCardTypeValue(rawCardType) ?? undefined;
+  if (
+    !firstSix ||
+    !lastFour ||
+    !token ||
+    !referenceNumber ||
+    !tokenHMAC
+  ) {
+    return null;
+  }
+  return {
+    firstSix,
+    lastFour,
+    token,
+    referenceNumber,
+    tokenHMAC,
+    maybeCardType,
+  };
+};
+
+const parseCardInputError = (error: unknown): string | null => {
+  if (!error || typeof error !== "object") return null;
+  const record = error as Record<string, unknown>;
+  const isValid = record.isValid;
+  const isCvvValid = record.isCvvValid;
+  if (isValid !== false && isCvvValid !== false) return null;
+
+  const messages: string[] = [];
+  if (isValid === false) {
+    const dataLength = record.dataLength;
+    if (dataLength === 0) {
+      messages.push("Card number is required.");
+    } else {
+      messages.push("Card number is invalid.");
+    }
+  }
+
+  if (isCvvValid === false) {
+    messages.push("CVV is invalid.");
+  }
+
+  return messages.length > 0 ? messages.join(" ") : null;
+};
+
 const parseTotalsResponse = (
   value: unknown
 ): { subtotal?: CurrencyCents; total?: CurrencyCents } => {
@@ -87,29 +216,33 @@ const parseTotalsResponse = (
 };
 
 export function PciCheckoutForm({ onSuccess }: { onSuccess: () => void }) {
-  const { user } = usePrivy();
-  const { wallet, ready } = useWallet();
-  const cardInputRef = useRef<{ getToken: () => Promise<CardTokenResponse> }>(
-    null
+  const { wallet } = useWallet();
+  const cardNumberInputRef = useRef<{
+    getToken(): Promise<CoinflowCardTokenResponse>;
+  }>();
+  const savedCardInputRef = useRef<{
+    getToken(): Promise<CardTokenResponse>;
+  }>();
+  const [newCardSubmission, dispatchNewCardSubmission] = useReducer(
+    submissionReducer,
+    initialSubmissionState
   );
-  const savedCardInputRef = useRef<{ getToken: () => Promise<CardTokenResponse> }>(
-    null
+  const [savedCardLookupSubmission, dispatchSavedCardLookupSubmission] = useReducer(
+    submissionReducer,
+    initialSubmissionState
   );
-  const [isCardSubmitting, setIsCardSubmitting] = useState(false);
-  const [isSavedSubmitting, setIsSavedSubmitting] = useState(false);
-  const [cardError, setCardError] = useState<string | null>(null);
-  const [savedError, setSavedError] = useState<string | null>(null);
+  const [savedCardCheckoutSubmission, dispatchSavedCardCheckoutSubmission] = useReducer(
+    submissionReducer,
+    initialSubmissionState
+  );
   const [savedCard, setSavedCard] = useState<SavedCard | null>(null);
-  const [cardSuccess, setCardSuccess] = useState<string | null>(null);
   const [checkoutMode, setCheckoutMode] = useState<"new" | "saved">("new");
   const [subtotal, setSubtotal] = useState<CurrencyCents | null>(null);
   const [total, setTotal] = useState<CurrencyCents | null>(null);
   const [isTotalsLoading, setIsTotalsLoading] = useState(false);
   const [totalsError, setTotalsError] = useState<string | null>(null);
-  const [sessionKey, setSessionKey] = useState<string | null>(null);
-  const [sessionKeyError, setSessionKeyError] = useState<string | null>(null);
-  const [isSessionKeyLoading, setIsSessionKeyLoading] = useState(false);
-  const [isSavedCardLoading, setIsSavedCardLoading] = useState(false);
+
+  // Prefilled for testing purposes
   const [formState, setFormState] = useState({
     expMonth: "05",
     expYear: "27",
@@ -125,38 +258,38 @@ export function PciCheckoutForm({ onSuccess }: { onSuccess: () => void }) {
 
   const origins = ["http://localhost:5173"];
 
-  const baseSubtotal = useMemo(() => ({ currency: "USD", cents: 20_00 }), []);
-  const resolvedSubtotal = useMemo(
-    () => subtotal ?? baseSubtotal,
-    [baseSubtotal, subtotal]
+  const defaultSubtotal = useMemo(() => ({ currency: "USD", cents: 20_00 }), []);
+  const checkoutSubtotal = useMemo(
+    () => subtotal ?? defaultSubtotal,
+    [defaultSubtotal, subtotal]
   );
-  const displayAmount = useMemo(
-    () => total ?? resolvedSubtotal,
-    [resolvedSubtotal, total]
+  const displayTotalAmount = useMemo(
+    () => total ?? checkoutSubtotal,
+    [checkoutSubtotal, total]
   );
-  const coinflowEnv = "sandbox";
-  const merchantId = MERCHANT_ID;
-  const apiBaseUrl = "https://api-sandbox.coinflow.cash";
-  const apiKey = SANDBOX_API_KEY;
-  const checkoutAuthKey = sessionKey ?? apiKey ?? null;
-  const isCheckoutReady = Boolean(checkoutAuthKey) && !isSessionKeyLoading;
-  const savedCheckoutTimeoutMs = 8000;
-  const buildHeaders = useCallback(
-    (extra?: Record<string, string>) => {
-      const headers: Record<string, string> = {
-        accept: "application/json",
-        "content-type": "application/json",
-        ...extra,
-      };
 
-      if (checkoutAuthKey) {
-        headers["x-coinflow-auth-session-key"] = checkoutAuthKey;
-      }
-
-      return headers;
-    },
-    [checkoutAuthKey]
-  );
+  const maybeWalletPublicKey = wallet.publicKey?.toString() ?? null;
+  const isCardSubmitting = newCardSubmission.status === "submitting";
+  const cardError =
+    newCardSubmission.status === "error" ? newCardSubmission.message : null;
+  const cardSuccess =
+    newCardSubmission.status === "success" ? newCardSubmission.message : null;
+  const isSavedCardLoading = savedCardLookupSubmission.status === "submitting";
+  const isSavedCardCheckoutSubmitting =
+    savedCardCheckoutSubmission.status === "submitting";
+  const maybeSavedCardType = savedCard?.cardType;
+  const isSavedCardUsable = maybeSavedCardType !== undefined;
+  const savedCardTypeLabel = maybeSavedCardType ?? "Unknown";
+  const savedError =
+    savedCardCheckoutSubmission.status === "error"
+      ? savedCardCheckoutSubmission.message
+      : savedCardLookupSubmission.status === "error"
+        ? savedCardLookupSubmission.message
+        : null;
+  const isSavedCardBusy = isSavedCardLoading || isSavedCardCheckoutSubmitting;
+  const maybeCardDisabledReason = isCardSubmitting ? "Card payment is processing." : null;
+  const isCardDisabled = maybeCardDisabledReason !== null;
+  const savedCardCheckoutTimeoutMs = 8000;
 
   const logError = useCallback((context: string, error: unknown) => {
     console.error(`[PciCheckoutForm] ${context}`, error);
@@ -171,26 +304,15 @@ export function PciCheckoutForm({ onSuccess }: { onSuccess: () => void }) {
     console.log(`[PciCheckoutForm] ${context}`, payload);
   }, []);
 
-  const getUserIdentifier = useCallback(() => {
-    const maybeEmail =
-      (user as { email?: { address?: string } } | null)?.email?.address ?? null;
-    if (maybeEmail) return maybeEmail;
-    return user?.id ?? null;
-  }, [user]);
-
   const inputStyles = useMemo(
     () => ({
-      base: 'font-family: "Red Hat Display", sans-serif;padding: 0 12px;border: 1px solid rgba(0, 0, 0, 0.15);margin: 0;width: 100%;font-size: 13px;line-height: 36px;height: 40px;box-sizing: border-box;-moz-box-sizing: border-box;border-radius: 12px;',
-      focus:
-        "box-shadow: 0 0 6px 0 rgba(59, 130, 246, 0.5);border: 1px solid rgba(59, 130, 246, 0.6);outline: 0;",
-      error:
-        "box-shadow: 0 0 6px 0 rgba(224, 57, 57, 0.5);border: 1px solid rgba(224, 57, 57, 0.5);",
+      base: 'font-family: Montserrat, sans-serif; padding: 0 8px; border: 0px; margin: 0; width: 100%; font-size: 13px; line-height: 48px; height: 48px; box-sizing: border-box; -moz-box-sizing: border-box;',
+      focus: 'outline: 0;',
+      error: 'box-shadow: 0 0 6px 0 rgba(224, 57, 57, 0.5); border: 1px solid rgba(224, 57, 57, 0.5);',
       cvv: {
-        base: 'font-family: "Red Hat Display", sans-serif;padding: 0 12px;border: 1px solid rgba(0, 0, 0, 0.15);margin: 0;width: 100%;font-size: 13px;line-height: 36px;height: 40px;box-sizing: border-box;-moz-box-sizing: border-box;border-radius: 12px;',
-        focus:
-          "box-shadow: 0 0 6px 0 rgba(59, 130, 246, 0.5);border: 1px solid rgba(59, 130, 246, 0.6);outline: 0;",
-        error:
-          "box-shadow: 0 0 6px 0 rgba(224, 57, 57, 0.5);border: 1px solid rgba(224, 57, 57, 0.5);",
+        base: 'font-family: Montserrat, sans-serif; padding: 0 8px; border: 0px; margin: 0; width: 100%; font-size: 13px; line-height: 48px; height: 48px; box-sizing: border-box; -moz-box-sizing: border-box;',
+        focus: 'outline: 0;',
+        error: 'box-shadow: 0 0 6px 0 rgba(224, 57, 57, 0.5); border: 1px solid rgba(224, 57, 57, 0.5);',
       },
     }),
     []
@@ -215,19 +337,17 @@ export function PciCheckoutForm({ onSuccess }: { onSuccess: () => void }) {
     return `Missing required fields: ${missingFields.join(", ")}`;
   }, [formState]);
 
-  const normalizeCardType = useCallback((value?: string | null) => {
-    if (!value) return null;
-    const upper = value.toUpperCase();
-    if (upper === "VISA") return CardType.VISA;
-    if (upper === "MASTER" || upper === "MASTERCARD" || upper === "MSTR") {
-      return CardType.MASTERCARD;
-    }
-    if (upper === "AMEX" || upper === "AMERICANEXPRESS") {
-      return CardType.AMEX;
-    }
-    if (upper === "DISC" || upper === "DISCOVER") return CardType.DISCOVER;
-    return null;
-  }, []);
+  const normalizeCardType = useCallback(normalizeCardTypeValue, []);
+
+  const buildSavedCardFromTokenPayload = useCallback(
+    (value: CardTokenPayload): SavedCard => ({
+      token: value.token,
+      cardType: value.maybeCardType,
+      firstSix: value.firstSix,
+      lastFour: value.lastFour,
+    }),
+    []
+  );
 
   const parseSavedCardEntry = useCallback(
     (value: unknown): SavedCard | null => {
@@ -241,17 +361,16 @@ export function PciCheckoutForm({ onSuccess }: { onSuccess: () => void }) {
       const cardTypeValue = parseString(
         record.cardType ?? record.type ?? record.brand ?? record.network
       );
-      const cardType = normalizeCardType(cardTypeValue);
-      if (!cardType) return null;
+      const cardType = normalizeCardType(cardTypeValue) ?? undefined;
 
-      const firstSix = parseString(
+      const maybeFirstSix = parseString(
         record.firstSix ??
           record.first_six ??
           record.first6 ??
           record.bin ??
           record.binNumber
       );
-      const lastFour = parseString(
+      const maybeLastFour = parseString(
         record.lastFour ??
           record.last_four ??
           record.last4 ??
@@ -261,14 +380,14 @@ export function PciCheckoutForm({ onSuccess }: { onSuccess: () => void }) {
       return {
         token,
         cardType,
-        firstSix: firstSix ?? undefined,
-        lastFour: lastFour ?? undefined,
+        firstSix: maybeFirstSix ?? undefined,
+        lastFour: maybeLastFour ?? undefined,
       };
     },
     [normalizeCardType]
   );
 
-  const parseSavedCardResponse = useCallback(
+  const extractFirstSavedCardFromCustomer = useCallback(
     (value: unknown): SavedCard | null => {
       if (!value || typeof value !== "object") return null;
       const record = value as Record<string, unknown>;
@@ -293,120 +412,22 @@ export function PciCheckoutForm({ onSuccess }: { onSuccess: () => void }) {
     [parseSavedCardEntry]
   );
 
-  const parseError = useCallback(async (response: Response) => {
-    const maybeJson = await response.json().catch(() => null);
-    if (maybeJson?.message) return maybeJson.message as string;
-    if (maybeJson?.error) return maybeJson.error as string;
-    return `Request failed with status ${response.status}`;
-  }, []);
-
-  const postJson = useCallback(
-    async (path: string, payload: object) => {
-      const response = await fetch(`${apiBaseUrl}${path}`, {
-        method: "POST",
-        headers: buildHeaders(),
-        body: JSON.stringify(payload),
-      });
-
-      if (!response.ok) {
-        throw new Error(await parseError(response));
-      }
-
-      return response.json().catch(() => ({}));
-    },
-    [apiBaseUrl, buildHeaders, parseError]
-  );
-
-  const fetchSessionKey = useCallback(async () => {
-    if (!ready) return;
-    if (sessionKey || isSessionKeyLoading) return;
-
-    setSessionKeyError(null);
-    setIsSessionKeyLoading(true);
-
-    const walletAddress = wallet.publicKey?.toString() ?? null;
-    const userId = getUserIdentifier();
-    if (!walletAddress && !userId) {
-      setSessionKeyError("Missing user identity for Coinflow session key.");
-      setIsSessionKeyLoading(false);
-      return;
-    }
-
-    try {
-      const headers: Record<string, string> = {
-        accept: "application/json",
-        Authorization: apiKey ?? "",
-      };
-
-      if (walletAddress) {
-        headers["x-coinflow-auth-blockchain"] = "solana";
-        headers["x-coinflow-auth-wallet"] = walletAddress;
-      } else if (userId) {
-        headers["x-coinflow-auth-user-id"] = userId;
-      }
-
-      const response = await fetch(`${apiBaseUrl}/api/auth/session-key`, {
-        method: "GET",
-        headers,
-      });
-
-      if (!response.ok) {
-        throw new Error(await parseError(response));
-      }
-
-      const data = (await response.json().catch(() => ({}))) as {
-        key?: string;
-      };
-      if (data.key) {
-        setSessionKey(data.key);
-        logSuccess("Session key fetched.");
-      } else {
-        setSessionKeyError("Coinflow session key missing from response.");
-      }
-    } catch (error) {
-      logError("Failed to fetch Coinflow session key.", error);
-      const message =
-        error instanceof Error
-          ? error.message
-          : "Failed to fetch Coinflow session key.";
-      setSessionKeyError(message);
-    } finally {
-      setIsSessionKeyLoading(false);
-    }
-  }, [
-    apiBaseUrl,
-    apiKey,
-    getUserIdentifier,
-    parseError,
-    ready,
-    wallet.publicKey,
-  ]);
-
   const fetchTotals = useCallback(async () => {
-    if (!checkoutAuthKey) {
-      setTotalsError(
-        "Waiting for Coinflow auth key before loading totals."
-      );
+    if (!maybeWalletPublicKey) {
+      setTotalsError("Missing user identity for Coinflow totals.");
       return;
     }
 
     setIsTotalsLoading(true);
     setTotalsError(null);
     try {
-      const response = await fetch(
-        `${apiBaseUrl}/api/checkout/totals/${merchantId}`,
-        {
-          method: "POST",
-          headers: buildHeaders(),
-          body: JSON.stringify({ subtotal: baseSubtotal }),
-        }
-      );
-
-      if (!response.ok) {
-        throw new Error(await parseError(response));
-      }
-
-      const data = await response.json().catch(() => ({}));
+      const data = await fetchCoinflowTotals({
+        apiBaseUrl: API_BASE_URL,
+        merchantId: MERCHANT_ID,
+        walletAddress: maybeWalletPublicKey,
+        authBlockchain: AUTH_BLOCKCHAIN,
+        subtotal: defaultSubtotal,
+      });
       const { subtotal: responseSubtotal, total: responseTotal } =
         parseTotalsResponse(data);
       if (responseSubtotal) setSubtotal(responseSubtotal);
@@ -424,105 +445,114 @@ export function PciCheckoutForm({ onSuccess }: { onSuccess: () => void }) {
       setIsTotalsLoading(false);
     }
   }, [
-    apiBaseUrl,
-    baseSubtotal,
-    buildHeaders,
-    checkoutAuthKey,
-    merchantId,
-    parseError,
+    API_BASE_URL,
+    defaultSubtotal,
+    logError,
+    logSuccess,
+    maybeWalletPublicKey,
+    MERCHANT_ID,
   ]);
 
   const fetchSavedCard = useCallback(async () => {
-    if (!checkoutAuthKey) {
-      setSavedError("Waiting for Coinflow auth key before loading saved card.");
+    dispatchSavedCardLookupSubmission({ type: "submit" });
+
+    if (!maybeWalletPublicKey) {
+      dispatchSavedCardLookupSubmission({
+        type: "error",
+        message: "Missing user identity for saved card.",
+      });
       return;
     }
 
-    setIsSavedCardLoading(true);
-    setSavedError(null);
     try {
-      const response = await fetch(`${apiBaseUrl}/api/customer/v2`, {
-        method: "GET",
-        headers: buildHeaders(),
+      const getCustomerResponse = await fetchCoinflowCustomer({
+        apiBaseUrl: API_BASE_URL,
+        walletAddress: maybeWalletPublicKey,
+        authBlockchain: AUTH_BLOCKCHAIN,
       });
-
-      if (!response.ok) {
-        throw new Error(await parseError(response));
-      }
-
-      const data = await response.json().catch(() => ({}));
-      const parsedCard = parseSavedCardResponse(data);
-      if (parsedCard) {
-        setSavedCard(parsedCard);
+      const maybeFirstSavedCard = extractFirstSavedCardFromCustomer(getCustomerResponse);
+      if (maybeFirstSavedCard) {
+        setSavedCard(maybeFirstSavedCard);
         logSuccess("Saved card fetched.", {
-          token: parsedCard.token,
-          cardType: parsedCard.cardType,
+          token: maybeFirstSavedCard.token,
+          cardType: maybeFirstSavedCard.cardType,
         });
+        dispatchSavedCardLookupSubmission({ type: "success" });
       } else {
-        setSavedError("No saved card available for this customer.");
+        dispatchSavedCardLookupSubmission({
+          type: "error",
+          message: "No saved card available for this customer.",
+        });
       }
     } catch (error) {
       logError("Failed to fetch saved card.", error);
       const message =
         error instanceof Error ? error.message : "Failed to fetch saved card.";
-      setSavedError(message);
-    } finally {
-      setIsSavedCardLoading(false);
+      dispatchSavedCardLookupSubmission({ type: "error", message });
     }
   }, [
-    apiBaseUrl,
-    buildHeaders,
-    checkoutAuthKey,
+    API_BASE_URL,
     logError,
     logSuccess,
-    parseError,
-    parseSavedCardResponse,
+    maybeWalletPublicKey,
+    extractFirstSavedCardFromCustomer,
   ]);
 
   useEffect(() => {
-    fetchSessionKey().catch((error) => {
-      logError("Unhandled session key rejection.", error);
-    });
-  }, [fetchSessionKey, logError]);
-
-  useEffect(() => {
-    if (!checkoutAuthKey) return;
     fetchTotals().catch((error) => {
-      logError("Unhandled totals rejection.", error);
+      logError("Failed to fetch totals.", error);
     });
-  }, [checkoutAuthKey, fetchTotals, logError]);
+  }, [fetchTotals, logError]);
 
   useEffect(() => {
     if (checkoutMode !== "saved") return;
     if (savedCard || isSavedCardLoading) return;
     fetchSavedCard().catch((error) => {
-      logError("Unhandled saved card rejection.", error);
+      logError("Failed to fetch saved card.", error);
     });
   }, [checkoutMode, fetchSavedCard, isSavedCardLoading, logError, savedCard]);
 
   const handleCardCheckout = useCallback(async () => {
-    setCardError(null);
-    setCardSuccess(null);
+    dispatchNewCardSubmission({ type: "reset" });
 
     const validationMessage = validateCardForm();
     if (validationMessage) {
-      setCardError(validationMessage);
+      dispatchNewCardSubmission({ type: "error", message: validationMessage });
       return;
     }
 
-    if (!cardInputRef.current) {
-      setCardError("Card inputs are not ready yet.");
+    if (!cardNumberInputRef.current) {
+      dispatchNewCardSubmission({
+        type: "error",
+        message: "Card inputs are not ready yet.",
+      });
       return;
     }
 
-    setIsCardSubmitting(true);
+    if (!maybeWalletPublicKey) {
+      dispatchNewCardSubmission({
+        type: "error",
+        message: "Missing user identity for Coinflow checkout.",
+      });
+      return;
+    }
+
+    dispatchNewCardSubmission({ type: "submit" });
     try {
-      const tokenResponse = await cardInputRef.current.getToken();
-      const cardType = normalizeCardType(tokenResponse.cardType);
+      const cardTokenResponse = await cardNumberInputRef.current.getToken();
+      const maybeParsedTokenResponse = parseCardTokenResponse(cardTokenResponse);
+      if (!maybeParsedTokenResponse) {
+        throw new Error("Card token response was invalid.");
+      }
+      const maybeSavedCard = buildSavedCardFromTokenPayload(maybeParsedTokenResponse);
+      if (maybeSavedCard) {
+        setSavedCard(maybeSavedCard);
+      }
       const payload = {
-        subtotal: resolvedSubtotal,
+        subtotal: {
+          cents: checkoutSubtotal.cents,
+        },
         card: {
-          cardToken: tokenResponse.token,
           expYear: formState.expYear,
           expMonth: formState.expMonth,
           email: formState.email,
@@ -533,91 +563,104 @@ export function PciCheckoutForm({ onSuccess }: { onSuccess: () => void }) {
           zip: formState.zip,
           state: formState.state,
           country: formState.country,
+          cardToken: maybeParsedTokenResponse.token,
         },
       };
 
-      await postJson(`/api/checkout/card/${merchantId}`, payload);
-      if (cardType) {
-        setSavedCard({
-          token: tokenResponse.token,
-          cardType,
-          firstSix: tokenResponse.firstSix,
-          lastFour: tokenResponse.lastFour,
-        });
-        setCardSuccess("Card checkout succeeded. Saved card is ready.");
-      } else {
-        setCardSuccess("Card checkout succeeded. Save card unavailable.");
-      }
+      const cardCheckoutResponse = await createCoinflowCardCheckout({
+        apiBaseUrl: API_BASE_URL,
+        merchantId: MERCHANT_ID,
+        walletAddress: maybeWalletPublicKey,
+        authBlockchain: AUTH_BLOCKCHAIN,
+        payload,
+      });
+      console.log("card checkout response: ", cardCheckoutResponse);
+      dispatchNewCardSubmission({ type: "success" });
       onSuccess();
     } catch (error) {
       logError("Card checkout failed.", error);
       const message =
-        error instanceof Error ? error.message : "Card checkout failed.";
-      setCardError(message);
-    } finally {
-      setIsCardSubmitting(false);
+        parseCardInputError(error) ??
+        (error instanceof Error ? error.message : "Card checkout failed.");
+      dispatchNewCardSubmission({ type: "error", message });
     }
   }, [
     formState,
-    merchantId,
-    normalizeCardType,
+    API_BASE_URL,
+    MERCHANT_ID,
     onSuccess,
-    postJson,
-    resolvedSubtotal,
+    checkoutSubtotal,
     validateCardForm,
+    maybeWalletPublicKey,
+    AUTH_BLOCKCHAIN,
+    buildSavedCardFromTokenPayload,
   ]);
 
   const handleSavedCardCheckout = useCallback(async () => {
-    setSavedError(null);
+    dispatchSavedCardCheckoutSubmission({ type: "reset" });
 
     if (!savedCard) {
-      setSavedError("No saved card available yet.");
+      dispatchSavedCardCheckoutSubmission({
+        type: "error",
+        message: "No saved card available yet.",
+      });
       return;
     }
 
     if (!savedCardInputRef.current) {
-      setSavedError("Saved card input is not ready yet.");
+      dispatchSavedCardCheckoutSubmission({
+        type: "error",
+        message: "Saved card input is not ready yet.",
+      });
       return;
     }
 
-    setIsSavedSubmitting(true);
+    dispatchSavedCardCheckoutSubmission({ type: "submit" });
     try {
       console.log("getting token...");
-      // Hangs here
+      // FIXME: Hangs here for some reason
       const tokenResponse = await savedCardInputRef.current.getToken();
       console.log("tokenResponse: ", tokenResponse);
       if (!tokenResponse?.token) {
-        setSavedError("TokenEx did not return a card token. Please retry.");
+        dispatchSavedCardCheckoutSubmission({
+          type: "error",
+          message: "TokenEx did not return a card token. Please retry.",
+        });
+        return;
+      }
+      if (!maybeWalletPublicKey) {
+        dispatchSavedCardCheckoutSubmission({
+          type: "error",
+          message: "Missing user identity for Coinflow checkout.",
+        });
         return;
       }
       const payload = {
-        subtotal: resolvedSubtotal,
+        subtotal: checkoutSubtotal,
         token: tokenResponse.token,
       };
 
-      const controller = new AbortController();
+      // For handling timeouts
+      const abortController = new AbortController();
       const timeoutId = setTimeout(() => {
-        controller.abort();
-      }, savedCheckoutTimeoutMs);
-      const response = await fetch(`${apiBaseUrl}/api/checkout/token/${merchantId}`, {
-        method: "POST",
-        headers: buildHeaders(),
-        body: JSON.stringify(payload),
-        signal: controller.signal,
+        abortController.abort();
+      }, savedCardCheckoutTimeoutMs);
+      const tokenCheckoutResponse = await createCoinflowTokenCheckout({
+        apiBaseUrl: API_BASE_URL,
+        merchantId: MERCHANT_ID,
+        walletAddress: maybeWalletPublicKey,
+        authBlockchain: AUTH_BLOCKCHAIN,
+        payload,
+        signal: abortController.signal,
       }).finally(() => {
         clearTimeout(timeoutId);
       });
-
-      if (!response.ok) {
-        throw new Error(await parseError(response));
-      }
-
-      const responseData = await response.json().catch(() => ({}));
-      console.log("checkout token response: ", response);
-      const updatedSavedCard = parseSavedCardResponse(responseData);
+      console.log("checkout token response: ", tokenCheckoutResponse);
+      const updatedSavedCard = extractFirstSavedCardFromCustomer(tokenCheckoutResponse);
       if (updatedSavedCard) {
         setSavedCard(updatedSavedCard);
       }
+      dispatchSavedCardCheckoutSubmission({ type: "success" });
       onSuccess();
     } catch (error) {
       logError("Saved card checkout failed.", error);
@@ -627,20 +670,17 @@ export function PciCheckoutForm({ onSuccess }: { onSuccess: () => void }) {
           : error instanceof Error
             ? error.message
             : "Saved card checkout failed.";
-      setSavedError(message);
-    } finally {
-      setIsSavedSubmitting(false);
+      dispatchSavedCardCheckoutSubmission({ type: "error", message });
     }
   }, [
-    apiBaseUrl,
-    buildHeaders,
-    merchantId,
+    API_BASE_URL,
+    MERCHANT_ID,
+    maybeWalletPublicKey,
     onSuccess,
-    parseSavedCardResponse,
-    parseError,
+    extractFirstSavedCardFromCustomer,
     savedCard,
-    savedCheckoutTimeoutMs,
-    resolvedSubtotal,
+    savedCardCheckoutTimeoutMs,
+    checkoutSubtotal,
   ]);
 
   return (
@@ -657,25 +697,33 @@ export function PciCheckoutForm({ onSuccess }: { onSuccess: () => void }) {
         </div>
 
         <div className="p-6 space-y-6">
-          <div className="inline-flex rounded-2xl bg-slate-100 p-1 text-xs font-semibold text-slate-600">
+          <div
+            role="tablist"
+            aria-label="Checkout mode"
+            className="grid w-full max-w-sm grid-cols-2 gap-3 text-xs font-semibold text-slate-400"
+          >
             <button
               type="button"
+              role="tab"
+              aria-selected={checkoutMode === "new"}
               onClick={() => setCheckoutMode("new")}
-              className={`rounded-2xl px-4 py-2 transition ${
+              className={`w-full rounded-t-xl border border-b-0 px-4 py-2 transition focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-slate-300 ${
                 checkoutMode === "new"
-                  ? "bg-white text-slate-900 shadow-sm"
-                  : "text-slate-500"
+                  ? "border-slate-200 bg-white text-slate-900 shadow-sm"
+                  : "border-transparent bg-slate-300 text-slate-500 hover:bg-slate-200 hover:text-slate-700"
               }`}
             >
               New Card
             </button>
             <button
               type="button"
+              role="tab"
+              aria-selected={checkoutMode === "saved"}
               onClick={() => setCheckoutMode("saved")}
-              className={`rounded-2xl px-4 py-2 transition ${
+              className={`w-full rounded-t-xl border border-b-0 px-4 py-2 transition focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-slate-300 ${
                 checkoutMode === "saved"
-                  ? "bg-white text-slate-900 shadow-sm"
-                  : "text-slate-500"
+                  ? "border-blue-200 bg-blue-50 text-blue-700 shadow-sm"
+                  : "border-transparent bg-blue-100 text-blue-500 hover:bg-blue-200 hover:text-blue-700"
               }`}
             >
               Saved Card
@@ -692,20 +740,12 @@ export function PciCheckoutForm({ onSuccess }: { onSuccess: () => void }) {
                   Amount:{" "}
                   {isTotalsLoading
                     ? "Loading totals..."
-                    : `$${(displayAmount.cents / 100).toFixed(2)} ${
-                        displayAmount.currency
+                    : `$${(displayTotalAmount.cents / 100).toFixed(2)} ${
+                        displayTotalAmount.currency
                       }`}
                 </p>
-                {isSessionKeyLoading ? (
-                  <p className="text-xs text-slate-500">
-                    Loading checkout session...
-                  </p>
-                ) : null}
                 {totalsError ? (
                   <p className="text-xs text-red-600">{totalsError}</p>
-                ) : null}
-                {sessionKeyError ? (
-                  <p className="text-xs text-red-600">{sessionKeyError}</p>
                 ) : null}
               </div>
 
@@ -714,8 +754,8 @@ export function PciCheckoutForm({ onSuccess }: { onSuccess: () => void }) {
                   Card Number
                 </label>
                 <CoinflowCardNumberInput
-                  ref={cardInputRef}
-                  env={coinflowEnv}
+                  ref={cardNumberInputRef}
+                  env={COINFLOW_ENV}
                   merchantId={MERCHANT_ID}
                   debug={true}
                   css={inputStyles}
@@ -804,9 +844,15 @@ export function PciCheckoutForm({ onSuccess }: { onSuccess: () => void }) {
                 <p className="text-xs text-emerald-600">{cardSuccess}</p>
               ) : null}
 
+              {isCardDisabled ? (
+                <div className="rounded-xl border border-blue-100 bg-blue-50 px-3 py-2 text-xs text-blue-700">
+                  {maybeCardDisabledReason ??
+                    "Complete checkout setup to pay with card."}
+                </div>
+              ) : null}
               <button
                 type="button"
-                disabled={isCardSubmitting || !isCheckoutReady}
+                disabled={isCardDisabled}
                 onClick={handleCardCheckout}
                 className="w-full rounded-2xl bg-blue-600 px-4 py-3 text-sm font-semibold text-white transition hover:bg-blue-500 disabled:cursor-not-allowed disabled:opacity-70"
               >
@@ -830,20 +876,29 @@ export function PciCheckoutForm({ onSuccess }: { onSuccess: () => void }) {
                 <>
                   <div className="rounded-xl bg-slate-50 p-3 text-xs text-slate-600">
                     Saved Card: {savedCard.firstSix ?? "••••••"}
-                    {savedCard.lastFour ?? "••••"} ({savedCard.cardType})
+                    {savedCard.lastFour ?? "••••"} ({savedCardTypeLabel})
                   </div>
-                  <label className="text-xs font-semibold text-slate-600">
-                    CVV
-                  </label>
-                  <CoinflowCvvOnlyInput
-                    ref={savedCardInputRef}
-                    env={coinflowEnv}
-                    merchantId={MERCHANT_ID}
-                    css={inputStyles}
-                    origins={origins}
-                    token={savedCard.token}
-                    cardType={savedCard.cardType}
-                  />
+                  {maybeSavedCardType ? (
+                    <>
+                      <label className="text-xs font-semibold text-slate-600">
+                        CVV
+                      </label>
+                      <CoinflowCvvOnlyInput
+                        ref={savedCardInputRef}
+                        env={COINFLOW_ENV}
+                        merchantId={MERCHANT_ID}
+                        css={inputStyles}
+                        origins={origins}
+                        token={savedCard.token}
+                        cardType={maybeSavedCardType}
+                      />
+                    </>
+                  ) : (
+                    <p className="text-xs text-amber-600">
+                      Saved card is missing the card type. Please re-save this
+                      card to enable saved checkout.
+                    </p>
+                  )}
                 </>
               ) : (
                 <p className="text-xs text-slate-500">
@@ -857,11 +912,15 @@ export function PciCheckoutForm({ onSuccess }: { onSuccess: () => void }) {
 
               <button
                 type="button"
-                disabled={isSavedSubmitting || !savedCard || !isCheckoutReady}
+                disabled={isSavedCardBusy || !savedCard || !isSavedCardUsable}
                 onClick={handleSavedCardCheckout}
-                className="w-full rounded-2xl border border-blue-600 px-4 py-3 text-sm font-semibold text-blue-600 transition hover:bg-blue-50 disabled:cursor-not-allowed disabled:opacity-60"
+                className="w-full rounded-2xl bg-blue-600 px-4 py-3 text-sm font-semibold text-white transition hover:bg-blue-500 disabled:cursor-not-allowed disabled:opacity-70"
               >
-                {isSavedSubmitting ? "Processing..." : "Pay with Saved Card"}
+                {isSavedCardCheckoutSubmitting
+                  ? "Processing..."
+                  : isSavedCardLoading
+                    ? "Loading..."
+                    : "Pay with Saved Card"}
               </button>
             </section>
           )}
